@@ -5,37 +5,35 @@ import importlib.util
 import numpy as _np_cpu
 import scipy.sparse as _sp_cpu
 
-# Select how you want to process data, GPU if fully available, else CPU
+# -------------------- backend selection --------------------
 _ON_GPU = False
 _xp = _np_cpu
 _sp = _sp_cpu
 _cp = None
 _cpx_sp = None
 
-# GPU availability requires: cupy, cupyx.scipy.sparse, and cuSPARSE runtime
 if importlib.util.find_spec("cupy") and importlib.util.find_spec("cupyx.scipy.sparse"):
     try:
         import cupy as _cp
         import cupyx.scipy.sparse as _cpx_sp
-        from cupyx import cusparse as _cusparse  # force-load CUDA sparse runtime
+        from cupyx import cusparse as _cusparse  # noqa: F401
+        _ = _cp.array([0]).sum()  # touch runtime
         _ON_GPU = True
         _xp = _cp
         _sp = _cpx_sp
     except Exception:
-        # cuSPARSE or other CUDA libs not present → stay on CPU
         _ON_GPU = False
         _xp = _np_cpu
         _sp = _sp_cpu
 
 EPS = 1e-12
 
-# Convert to sparse representation between CPU/GPU backends 
-def _to_backend_csr(A) -> _sp.csr_matrix:
+# -------------------- conversions & checks --------------------
+def _to_backend_csr(A):
     """
-    Convert an input sparse matrix to the active backend's CSR type:
-      - GPU active: SciPy CSR -> cupyx CSR (device)
-      - CPU active: cupyx CSR -> SciPy CSR (host)
-      - Pass-through if already correct
+    Convert to active backend CSR:
+      - GPU: SciPy CSR -> cupyx CSR (device)
+      - CPU: cupyx CSR -> SciPy CSR (host)
     """
     if _ON_GPU:
         if isinstance(A, _cpx_sp.csr_matrix):
@@ -51,8 +49,7 @@ def _to_backend_csr(A) -> _sp.csr_matrix:
     else:
         if _sp_cpu.isspmatrix_csr(A):
             return A
-        # only attempt cupyx -> scipy if cupyx actually importable in this env
-        if importlib.util.find_spec("cupyx"):
+        if importlib.util.find_spec("cupy") and importlib.util.find_spec("cupyx.scipy.sparse"):
             try:
                 if isinstance(A, _cpx_sp.csr_matrix):
                     return _sp_cpu.csr_matrix(
@@ -65,44 +62,83 @@ def _to_backend_csr(A) -> _sp.csr_matrix:
             return A.tocsr(copy=False)
         raise TypeError(f"Expected SciPy/cupyx sparse matrix, got {type(A)}")
 
-# Core helpers 
 def _require_csr(A, name: str):
     A = _to_backend_csr(A)
     if A.shape[0] != A.shape[1]:
         raise ValueError(f"{name} must be square (got {A.shape})")
-    if (A.data < -1e-12).any():
+    if (_xp.asarray(A.data) < -1e-12).any():
         raise ValueError(f"{name} contains negative values")
     return A
 
+# -------------------- small ops --------------------
 def _row_sums(A):
     rs = _xp.asarray(A.sum(axis=1)).ravel()
     rs[~_xp.isfinite(rs)] = 0.0
     return rs
 
-def _row_normalize(A):
-    inv = 1.0 / (_row_sums(A) + EPS)
-    return _sp.diags(inv).dot(A)
-
 def _symmetrize(A):
     return ((A + A.T) * 0.5).tocsr()
 
-def _csr_row_entropy(A):
-    """Row-wise Shannon entropy on the active backend (GPU/CPU)."""
-    indptr, data = A.indptr, A.data
-    n = A.shape[0]
-    out = _xp.empty(n, dtype=_xp.float32)
-    for i in range(n):
-        seg = data[indptr[i]:indptr[i+1]]
-        seg = _xp.asarray(seg)  # ensure backend array
-        s = seg.sum()
-        if s <= 0:
-            out[i] = _xp.float32(0.0)
-            continue
-        p = seg / (s + EPS)
-        out[i] = -_xp.sum(p * _xp.log(p + EPS), dtype=_xp.float32)
-    return out
+# ---------- fast CSR helpers (CPU & GPU) ----------
+# cache row_ids by the CSR's indptr memory address to reuse across calls
+_rid_cache: dict[int, object] = {}
 
-#  Public API
+def _indptr_addr(A) -> int:
+    indptr = A.indptr
+    if _ON_GPU:
+        return int(indptr.data.ptr)  # CuPy device pointer
+    else:
+        return int(indptr.__array_interface__['data'][0])  # NumPy host pointer
+
+def _csr_row_ids(A):
+    """
+    Return row_id for each nonzero in CSR matrix A (length = nnz).
+
+    Fully device-side on CuPy using searchsorted (no host hop).
+    Vectorized on NumPy as well.
+    """
+    key = _indptr_addr(A)
+    cached = _rid_cache.get(key, None)
+    if cached is not None and cached.shape[0] == A.nnz:
+        return cached
+
+    indptr = A.indptr  # shape (n+1,)
+    nnz = A.nnz
+    # rid[i] = largest r such that indptr[r] <= i < indptr[r+1]
+    # i.e., searchsorted(indptr, i, 'right') - 1 for i in 0..nnz-1
+    rid = _xp.searchsorted(indptr, _xp.arange(nnz, dtype=indptr.dtype), side='right') - 1
+    # ensure 32-bit int for indexing data (works on both backends)
+    rid = rid.astype(_xp.int32, copy=False)
+    _rid_cache[key] = rid
+    return rid
+
+def _csr_row_scale_inplace(A, scale):
+    """Scale each row i of CSR A by scale[i] in-place (no diag())."""
+    rid = _csr_row_ids(A)
+    A.data *= scale[rid]
+    return A
+
+def _row_normalize_inplace(A):
+    """Row-normalize CSR A in-place (no diag())."""
+    inv = 1.0 / (_row_sums(A) + EPS)
+    _csr_row_scale_inplace(A, _xp.asarray(inv, dtype=A.data.dtype))
+    return A
+
+def _csr_row_entropy_vectorized(A):
+    """
+    Row-wise Shannon entropy without Python loops.
+    H_i = -sum_j p_ij log(p_ij),  p_ij = a_ij / sum_j a_ij
+    """
+    n = A.shape[0]
+    rs = _row_sums(A) + EPS
+    rid = _csr_row_ids(A)
+    p = A.data / rs[rid]
+    term = p * _xp.log(p + EPS)
+    out = _xp.zeros(n, dtype=_xp.float32)
+    _xp.add.at(out, rid, term.astype(_xp.float32, copy=False))
+    return -out
+
+# -------------------- public API --------------------
 def compute_modality_weights(
     Ar,
     Aa,
@@ -111,10 +147,6 @@ def compute_modality_weights(
 ):
     """
     Return per-cell weights (wr, wa) with wr+wa==1 on the active backend.
-
-    Ar, Aa: CSR sparse matrices (SciPy or cupyx accepted)
-    mode  : "entropy_inverse" | "degree" | "uniform"
-    temperature: >1 softens toward 0.5; <1 sharpens.
     """
     Ar = _require_csr(Ar, "Ar")
     Aa = _require_csr(Aa, "Aa")
@@ -125,29 +157,37 @@ def compute_modality_weights(
     if mode == "uniform":
         wr = _xp.full(n, 0.5, dtype=_xp.float32)
         wa = 1.0 - wr
+
     elif mode == "degree":
         sr = _row_sums(Ar)
         sa = _row_sums(Aa)
         z = sr + sa + EPS
         wr, wa = (sr / z).astype(_xp.float32), (sa / z).astype(_xp.float32)
+
     elif mode == "entropy_inverse":
-        Hr = _csr_row_entropy(Ar)
-        Ha = _csr_row_entropy(Aa)
+        Hr = _csr_row_entropy_vectorized(Ar)
+        Ha = _csr_row_entropy_vectorized(Aa)
         sharp_r = 1.0 / (Hr + EPS)
         sharp_a = 1.0 / (Ha + EPS)
         z = sharp_r + sharp_a + EPS
         wr, wa = (sharp_r / z).astype(_xp.float32), (sharp_a / z).astype(_xp.float32)
+
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
+    # Temperature (avoid cp.clip on scalars)
     if temperature != 1.0:
-        alpha = _xp.float32(_xp.clip(1.0 / float(temperature), 0.0, 1e6))
+        alpha = 1.0 / float(temperature)
+        if alpha < 0.0: alpha = 0.0
+        if alpha > 1e6: alpha = 1e6
+        alpha = _xp.float32(alpha)
         wr, wa = wr**alpha, wa**alpha
         z = wr + wa + EPS
         wr, wa = (wr / z).astype(_xp.float32), (wa / z).astype(_xp.float32)
 
-    wr = _xp.clip(wr, 0.0, 1.0)
-    wa = _xp.clip(wa, 0.0, 1.0)
+    # Clamp to [0,1] without xp.clip
+    wr = _xp.minimum(_xp.maximum(wr, 0.0), 1.0)
+    wa = _xp.minimum(_xp.maximum(wa, 0.0), 1.0)
     z = wr + wa + EPS
     return (wr / z).astype(_xp.float32), (wa / z).astype(_xp.float32)
 
@@ -163,7 +203,8 @@ def fuse_adjacencies(
     prune_below: Optional[float] = 1e-6,
 ):
     """
-    A_fused = normalize( symmetrize( diag(wr) @ Ar + diag(wa) @ Aa ) + self-loops )
+    A_fused = normalize( symmetrize( rowScale(wr, Ar) + rowScale(wa, Aa) ) + self-loops )
+    (Row scaling is done in-place on CSR data; no diag() materialization.)
     """
     Ar = _require_csr(Ar, "Ar")
     Aa = _require_csr(Aa, "Aa")
@@ -171,7 +212,13 @@ def fuse_adjacencies(
     if wr.shape[0] != n or wa.shape[0] != n:
         raise ValueError("wr/wa length must equal number of rows")
 
-    A = _sp.diags(wr).dot(Ar) + _sp.diags(wa).dot(Aa)
+    # Row-scale without diag()
+    Ar_scaled = Ar.copy()
+    Aa_scaled = Aa.copy()
+    _csr_row_scale_inplace(Ar_scaled, _xp.asarray(wr, dtype=Ar_scaled.data.dtype))
+    _csr_row_scale_inplace(Aa_scaled, _xp.asarray(wa, dtype=Aa_scaled.data.dtype))
+
+    A = Ar_scaled + Aa_scaled
 
     if add_self_loops and self_loop_weight > 0:
         A = A + _sp.eye(n, dtype=A.dtype, format="csr") * float(self_loop_weight)
@@ -182,7 +229,7 @@ def fuse_adjacencies(
     A.data = _xp.maximum(A.data, 0.0)
 
     if row_normalize:
-        A = _row_normalize(A)
+        _row_normalize_inplace(A)
 
     if prune_below is not None and prune_below > 0:
         A.data[A.data < prune_below] = 0.0
@@ -200,12 +247,10 @@ def fuse_from_mudata(
     temperature: float = 1.0,
     obsp_out: str = "wnn_connectivities",
     obs_weight_keys: Tuple[str, str] = ("wnn_weight_rna", "wnn_weight_atac"),
-    ) -> None:
+) -> None:
     """
     Pull per-modality graphs from `mdata.mod[*].obsp['connectivities']`,
-    compute per-cell weights, fuse, and write back to `mdata`:
-      - `mdata.obsp[obsp_out]` fused CSR (GPU CSR if GPU active, else SciPy CSR)
-      - `mdata.obs[...]` per-cell weights (NumPy arrays for cross-compatibility)
+    compute per-cell weights, fuse, and write back to `mdata`.
     """
     from anndata import AnnData  # noqa: F401
     from muon import MuData      # noqa: F401
@@ -231,7 +276,7 @@ def fuse_from_mudata(
         mdata.obs[obs_weight_keys[0]] = wr
         mdata.obs[obs_weight_keys[1]] = wa
 
-# Utility for tests/benchmarks
+# -------------------- small utility for tests --------------------
 def make_knn_graph_cpu(n=1000, k=30, seed=0) -> _sp_cpu.csr_matrix:
     rng = _np_cpu.random.default_rng(seed)
     rows = _np_cpu.repeat(_np_cpu.arange(n), k)
